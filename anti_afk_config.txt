@@ -1,4 +1,4 @@
-# Anti-AFK Configuration / 防挂机检测提出配置
+# Anti-AFK Configuration / 防挂机检测踢出配置
 # 放在游戏根目录（与 Endfield.exe 同级）
 
 # 发送保活包的间隔时间（分钟），范围 1-30

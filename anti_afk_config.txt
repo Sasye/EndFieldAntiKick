@@ -1,0 +1,12 @@
+# Anti-AFK Configuration / 防挂机检测提出配置
+# 放在游戏根目录（与 Endfield.exe 同级）
+
+# 发送保活包的间隔时间（分钟），范围 1-30
+# 建议 3-5 分钟，太频繁可能被检测，太久可能来不及
+interval_minutes=4
+
+# 是否启用 (1=启用, 0=禁用)
+enabled=1
+
+# 是否输出调试日志到 anti_afk_log.txt (1=启用, 0=禁用)
+debug_log=1

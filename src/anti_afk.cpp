@@ -2,6 +2,7 @@
 #include "MinHook.h"
 #include <fstream>
 #include <string>
+#include <stdlib.h>
 #include <windows.h>
 
 extern "C" __declspec(dllexport) void DummyExport() {}
@@ -425,6 +426,8 @@ DWORD WINAPI h_GetFileAttributesW(LPCWSTR lpFileName) {
 // ============================================================================
 // Main anti-AFK thread
 // ============================================================================
+static void *g_domain = nullptr;
+
 DWORD WINAPI AntiAFKThread(LPVOID lpParam) {
   DebugLog("Anti-AFK thread started, interval=%d minutes", g_intervalMinutes);
 
@@ -440,42 +443,65 @@ DWORD WINAPI AntiAFKThread(LPVOID lpParam) {
   }
   DebugLog("Il2Cpp APIs resolved");
 
-  void *domain = il2cpp_domain_get();
-  if (!domain) {
+  // Resolve il2cpp_thread_detach
+  typedef void (*Il2CppThreadDetach)(void *thread);
+  auto il2cpp_thread_detach = (Il2CppThreadDetach)GetProcAddress(
+      hGameAssembly, "il2cpp_thread_detach");
+
+  g_domain = il2cpp_domain_get();
+  if (!g_domain) {
     DebugLog("Failed to get Il2Cpp domain");
     return 1;
   }
-  il2cpp_thread_attach(domain);
+
+  // Attach to resolve classes, then detach
+  void *thread = (void *)il2cpp_thread_attach(g_domain);
 
   size_t asmCount = 0;
-  void **assemblies = (void **)il2cpp_domain_get_assemblies(domain, &asmCount);
+  void **assemblies = (void **)il2cpp_domain_get_assemblies(g_domain, &asmCount);
   if (!assemblies || asmCount == 0) {
     DebugLog("Failed to get assemblies");
+    if (il2cpp_thread_detach && thread) il2cpp_thread_detach(thread);
     return 1;
   }
   DebugLog("Found %zu assemblies", asmCount);
 
   if (!ResolveSendMethod(assemblies, asmCount)) {
     DebugLog("Failed to resolve send method chain");
+    if (il2cpp_thread_detach && thread) il2cpp_thread_detach(thread);
     return 1;
   }
 
   if (!ResolveProtoMessages(assemblies, asmCount)) {
     DebugLog("Failed to resolve proto messages");
+    if (il2cpp_thread_detach && thread) il2cpp_thread_detach(thread);
     return 1;
   }
+
+  // Detach after init - sleep in detached state so Il2Cpp won't wait for us
+  if (il2cpp_thread_detach && thread)
+    il2cpp_thread_detach(thread);
 
   DebugLog("All resolved, entering main loop (using %s)",
            g_sceneRestClass  ? "CS_SCENE_REST" :
            g_flushSyncClass  ? "CS_FLUSH_SYNC" : "CS_PING");
 
-  // Main loop - WaitForSingleObject instead of Sleep for clean shutdown
-  DWORD intervalMs = g_intervalMinutes * 60 * 1000;
+  // Main loop with randomized interval
+  srand((unsigned int)GetTickCount());
+  DWORD baseMs = g_intervalMinutes * 60 * 1000;
   while (true) {
+    DWORD jitter = baseMs * 30 / 100;
+    DWORD intervalMs = baseMs - jitter + (rand() % (jitter * 2 + 1));
+    DebugLog("Next packet in %lu seconds", intervalMs / 1000);
     DWORD waitResult = WaitForSingleObject(g_shutdownEvent, intervalMs);
     if (waitResult == WAIT_OBJECT_0)
-      break; // shutdown signaled
+      break;
+
+    // Attach briefly just for the send, then detach
+    void *t = (void *)il2cpp_thread_attach(g_domain);
     SendAntiAFKPacket();
+    if (il2cpp_thread_detach && t)
+      il2cpp_thread_detach(t);
   }
 
   DebugLog("Anti-AFK thread exiting cleanly");
@@ -505,15 +531,13 @@ void Setup() {
 
   g_shutdownEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
 
+  // Install stealth hooks to hide anti_afk.dll from file scans
   MH_Initialize();
-  HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
-  if (hKernelBase) {
-    MH_CreateHookApi(L"kernelbase.dll", "CreateFileW", (LPVOID)h_CreateFileW,
-                     (LPVOID *)&p_CreateFileW);
-    MH_CreateHookApi(L"kernelbase.dll", "GetFileAttributesW",
-                     (LPVOID)h_GetFileAttributesW,
-                     (LPVOID *)&p_GetFileAttributesW);
-  }
+  MH_CreateHookApi(L"kernelbase.dll", "CreateFileW", (LPVOID)h_CreateFileW,
+                   (LPVOID *)&p_CreateFileW);
+  MH_CreateHookApi(L"kernelbase.dll", "GetFileAttributesW",
+                   (LPVOID)h_GetFileAttributesW,
+                   (LPVOID *)&p_GetFileAttributesW);
   MH_EnableHook(MH_ALL_HOOKS);
   DebugLog("Stealth hooks installed");
 
@@ -525,16 +549,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     DisableThreadLibraryCalls(hModule);
     CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Setup, NULL, 0, NULL);
   } else if (reason == DLL_PROCESS_DETACH) {
-    // Signal the anti-AFK thread to exit
+    if (reserved != NULL)
+      return TRUE; // process terminating, skip cleanup
+
     if (g_shutdownEvent)
       SetEvent(g_shutdownEvent);
-    // Wait briefly for thread to finish
     if (g_thread) {
       WaitForSingleObject(g_thread, 2000);
       CloseHandle(g_thread);
     }
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
     if (g_shutdownEvent)
       CloseHandle(g_shutdownEvent);
   }

@@ -1,5 +1,7 @@
 # Endfield AntiKick
 
+[English](README_EN.md) | 中文
+
 防止《明日方舟：终末地》长时间挂机被服务器踢出。
 
 ## 安装

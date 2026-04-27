@@ -18,11 +18,15 @@ echo [OK] MSVC compiler found
 echo.
 
 :: Build anti_afk.dll
-echo [1/2] Building anti_afk.dll ...
+echo [1/3] Compiling version resource ...
+rc /nologo /fo bin\version.res src\version.rc
+
+echo [2/3] Building anti_afk.dll ...
 cl /nologo /O2 /MD /LD /EHsc /std:c++17 ^
     /I"deps\minhook_lib\include" ^
     src\anti_afk.cpp ^
     "deps\minhook_lib\lib\libMinHook.x64.lib" ^
+    bin\version.res ^
     /Fe"bin\anti_afk.dll" ^
     /link /DLL
 
@@ -35,7 +39,7 @@ echo [OK] anti_afk.dll built successfully
 echo.
 
 :: Build d3dcompiler_47.dll (proxy loader)
-echo [2/2] Building d3dcompiler_47.dll (proxy loader) ...
+echo [3/3] Building d3dcompiler_47.dll (proxy loader) ...
 cl /nologo /O2 /MD /LD /EHsc /std:c++17 ^
     src\proxy_d3dcompiler.cpp ^
     /Fe"bin\d3dcompiler_47.dll" ^

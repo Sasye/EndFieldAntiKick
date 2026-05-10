@@ -9,9 +9,10 @@
 将以下文件复制到游戏目录（`Endfield.exe` 所在文件夹）：
 
 ```
-bin/anti_afk.dll         → 游戏目录/anti_afk.dll
+bin/anti_afk.dll         → 游戏目录/plugin/anti_afk.dll
+anti_afk_config.txt      → 游戏目录/plugin/anti_afk_config.txt
+bin/vulkan-1.dll         → 游戏目录/vulkan-1.dll
 bin/d3dcompiler_47.dll   → 游戏目录/d3dcompiler_47.dll
-anti_afk_config.txt      → 游戏目录/anti_afk_config.txt
 ```
 
 ## 免责声明

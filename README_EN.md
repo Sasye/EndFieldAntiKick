@@ -9,9 +9,10 @@ Prevents being kicked from *Arknights: Endfield* servers due to prolonged inacti
 Copy the following files to the game directory (same folder as `Endfield.exe`):
 
 ```
-bin/anti_afk.dll         → Game Directory/anti_afk.dll
+bin/anti_afk.dll         → Game Directory/plugin/anti_afk.dll
+anti_afk_config.txt      → Game Directory/plugin/anti_afk_config.txt
+bin/vulkan-1.dll         → Game Directory/vulkan-1.dll
 bin/d3dcompiler_47.dll   → Game Directory/d3dcompiler_47.dll
-anti_afk_config.txt      → Game Directory/anti_afk_config.txt
 ```
 
 ## Disclaimer

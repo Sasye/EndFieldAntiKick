@@ -46,6 +46,8 @@ if %errorlevel% equ 0 (
 echo [OK] MSVC compiler found
 echo.
 
+if not exist bin mkdir bin
+
 :: Build anti_afk.dll
 echo [1/4] Compiling version resource ...
 rc /nologo /fo bin\version.res src\version.rc

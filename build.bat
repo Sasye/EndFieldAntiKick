@@ -90,8 +90,8 @@ echo   - d3dcompiler_47.dll    (DX proxy loader)
 echo   - vulkan-1.dll          (Vulkan proxy loader)
 echo.
 echo To install, copy to game folder:
-echo   bin\anti_afk.dll         -> game folder
-echo   bin\d3dcompiler_47.dll   -> game folder
-echo   anti_afk_config.txt      -> game folder
+echo   bin\anti_afk.dll         -^> game folder
+echo   bin\d3dcompiler_47.dll   -^> game folder
+echo   anti_afk_config.txt      -^> game folder
 echo.
 pause

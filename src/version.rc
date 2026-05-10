@@ -1,8 +1,8 @@
 #include <winver.h>
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,0,2,0
-PRODUCTVERSION  0,0,2,0
+FILEVERSION     0,0,3,0
+PRODUCTVERSION  0,0,3,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "EndfieldAntiKick"
             VALUE "FileDescription",  "Endfield Anti-AFKKick Plugin"
-            VALUE "FileVersion",      "0.0.2"
+            VALUE "FileVersion",      "0.0.3"
             VALUE "InternalName",     "anti_afk"
             VALUE "LegalCopyright",   "AGPL-3.0"
             VALUE "OriginalFilename", "anti_afk.dll"
             VALUE "ProductName",      "EndfieldAntiKick"
-            VALUE "ProductVersion",   "0.0.2"
+            VALUE "ProductVersion",   "0.0.3"
         END
     END
     BLOCK "VarFileInfo"

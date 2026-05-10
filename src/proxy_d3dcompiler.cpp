@@ -86,17 +86,25 @@
     "/export:DebugSetMute=C:\\Windows\\System32\\d3dcompiler_47.DebugSetMute")
 
 // --- Payload ---
-void LoadBypass() {
-  HMODULE hBypass = LoadLibraryA("ace_inject.dll");
-  HMODULE hGfx = LoadLibraryA("ace_inject-1.dll");
-  HMODULE hAntiAFK = LoadLibraryA("anti_afk.dll");
+void LoadPlugin() {
+  // Auto-load all DLLs from 'plugin' subdirectory
+  WIN32_FIND_DATAA fd;
+  HANDLE hFind = FindFirstFileA("plugin\\*.dll", &fd);
+  if (hFind != INVALID_HANDLE_VALUE) {
+    do {
+      char path[MAX_PATH];
+      snprintf(path, MAX_PATH, "plugin\\%s", fd.cFileName);
+      LoadLibraryA(path);
+    } while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
+  }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(hModule);
     // Create a thread to load the bypass DLL to prevent blocking the DllMain
-    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)LoadBypass, NULL, 0, NULL);
+    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)LoadPlugin, NULL, 0, NULL);
   }
   return TRUE;
 }

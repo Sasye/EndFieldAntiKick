@@ -14,6 +14,15 @@ int g_intervalMinutes = 4;
 bool g_enabled = true;
 bool g_debugLog = false;
 
+// ============================================================================
+// Compatibility & Version Definitions
+// ============================================================================
+// If a game update changes method signatures, update these constants
+#define EXPECTED_GETINSTANCE_PARAMS 0
+#define EXPECTED_GETSENDER_PARAMS 0
+#define EXPECTED_SEND_PARAMS 1
+#define EXPECTED_CTOR_PARAMS 0
+
 // Shutdown event - signaled on DLL_PROCESS_DETACH to wake sleeping threads
 HANDLE g_shutdownEvent = NULL;
 
@@ -215,7 +224,7 @@ bool ResolveSendMethod(void **assemblies, size_t count) {
   }
   if (!g_getInstanceMethod)
     g_getInstanceMethod =
-        il2cpp_class_get_method_from_name(g_netBusClass, "get_instance", 0);
+        il2cpp_class_get_method_from_name(g_netBusClass, "get_instance", EXPECTED_GETINSTANCE_PARAMS);
   if (!g_getInstanceMethod) {
     DebugLog("ERROR: Could not find NetBus.instance getter");
     return false;
@@ -231,7 +240,7 @@ bool ResolveSendMethod(void **assemblies, size_t count) {
   }
   if (!g_getSenderMethod)
     g_getSenderMethod = il2cpp_class_get_method_from_name(
-        g_netBusClass, "get_defaultSender", 0);
+        g_netBusClass, "get_defaultSender", EXPECTED_GETSENDER_PARAMS);
   if (!g_getSenderMethod) {
     DebugLog("ERROR: Could not find NetBus.defaultSender getter");
     return false;
@@ -253,7 +262,7 @@ bool ResolveSenderSendMethod(void *sender) {
     if (senderClass) {
       if (il2cpp_class_get_name)
         DebugLog("Sender class: %s", il2cpp_class_get_name(senderClass));
-      g_sendMethod = il2cpp_class_get_method_from_name(senderClass, "Send", 1);
+      g_sendMethod = il2cpp_class_get_method_from_name(senderClass, "Send", EXPECTED_SEND_PARAMS);
       if (g_sendMethod) {
         DebugLog("Found sender.Send(msg) method");
         return true;
@@ -316,7 +325,7 @@ bool SendAntiAFKPacket() {
     msg = il2cpp_object_new(g_friendSyncClass);
     if (msg) {
       void *ctor =
-          il2cpp_class_get_method_from_name(g_friendSyncClass, ".ctor", 0);
+          il2cpp_class_get_method_from_name(g_friendSyncClass, ".ctor", EXPECTED_CTOR_PARAMS);
       if (ctor)
         il2cpp_runtime_invoke(ctor, msg, nullptr, nullptr);
       g_activeMsgName = "CS_FRIEND_LIST_SIMPLE_SYNC";
@@ -325,7 +334,7 @@ bool SendAntiAFKPacket() {
     msg = il2cpp_object_new(g_sceneRestClass);
     if (msg) {
       void *ctor =
-          il2cpp_class_get_method_from_name(g_sceneRestClass, ".ctor", 0);
+          il2cpp_class_get_method_from_name(g_sceneRestClass, ".ctor", EXPECTED_CTOR_PARAMS);
       if (ctor)
         il2cpp_runtime_invoke(ctor, msg, nullptr, nullptr);
       g_activeMsgName = "CS_SCENE_REST";
@@ -333,7 +342,7 @@ bool SendAntiAFKPacket() {
   } else if (g_pingClass) {
     msg = il2cpp_object_new(g_pingClass);
     if (msg) {
-      void *ctor = il2cpp_class_get_method_from_name(g_pingClass, ".ctor", 0);
+      void *ctor = il2cpp_class_get_method_from_name(g_pingClass, ".ctor", EXPECTED_CTOR_PARAMS);
       if (ctor)
         il2cpp_runtime_invoke(ctor, msg, nullptr, nullptr);
       if (g_pingField && il2cpp_field_set_value) {
@@ -351,7 +360,13 @@ bool SendAntiAFKPacket() {
 
   void *sendParams[] = {msg};
   void *exc = nullptr;
-  il2cpp_runtime_invoke(g_sendMethod, sender, sendParams, &exc);
+  
+  __try {
+    il2cpp_runtime_invoke(g_sendMethod, sender, sendParams, &exc);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    DebugLog("ERROR: SEH Exception caught during g_sendMethod invocation! Ignored to prevent crash.");
+    return false;
+  }
 
   if (exc) {
     DebugLog("Send threw an exception");
@@ -484,7 +499,11 @@ DWORD WINAPI AntiAFKThread(LPVOID lpParam) {
 
     // Attach briefly just for the send, then detach
     void *t = (void *)il2cpp_thread_attach(g_domain);
-    SendAntiAFKPacket();
+    __try {
+      SendAntiAFKPacket();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      DebugLog("ERROR: SEH Exception caught inside SendAntiAFKPacket routine! Recovering safely.");
+    }
     if (il2cpp_thread_detach && t)
       il2cpp_thread_detach(t);
   }

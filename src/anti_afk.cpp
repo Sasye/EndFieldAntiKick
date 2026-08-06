@@ -1,4 +1,6 @@
-#define _CRT_SECURE_NO_WARNINGS
+﻿#define _CRT_SECURE_NO_WARNINGS
+#define APPLEPIE_PLUGIN_IMPL
+#include "applepie_mgr.h"
 #include "MinHook.h"
 #include <fstream>
 #include <stdlib.h>
@@ -13,6 +15,7 @@ extern "C" __declspec(dllexport) void DummyExport() {}
 int g_intervalMinutes = 4;
 bool g_enabled = true;
 bool g_debugLog = false;
+static volatile bool g_pluginActive = true;
 
 // ============================================================================
 // Compatibility & Version Definitions
@@ -302,6 +305,12 @@ bool ResolveProtoMessages(void **assemblies, size_t count) {
 }
 
 bool SendAntiAFKPacket() {
+  // Plugin Manager: skip sending when paused
+  if (!g_pluginActive) {
+    DebugLog("Anti-AFK paused by Plugin Manager");
+    return true;
+  }
+
   void *netBusInstance =
       il2cpp_runtime_invoke(g_getInstanceMethod, nullptr, nullptr, nullptr);
   if (!netBusInstance) {
@@ -566,4 +575,35 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
       CloseHandle(g_shutdownEvent);
   }
   return TRUE;
+}
+
+// ============================================================================
+// Plugin Manager Interface
+// ============================================================================
+static AP_PluginInfo s_pluginInfo = {
+    APPLEPIE_PLUGIN_API_VERSION,
+    "anti_afk",
+    "Anti-AFK",
+    "Prevent AFK detection kick",
+    "anti_afk_config.txt",
+    true  // supports hot disable
+};
+
+APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() {
+    return &s_pluginInfo;
+}
+
+APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
+    g_pluginActive = true;
+    return true;
+}
+
+APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
+    g_pluginActive = false;
+    return true;
+}
+
+APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
+    LoadConfig();
+    return true;
 }

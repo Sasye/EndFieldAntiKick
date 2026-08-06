@@ -4,6 +4,8 @@ English | [中文](README.md)
 
 Prevents being kicked from *Arknights: Endfield* servers due to prolonged inactivity.
 
+> Use [Applepie Manager](https://github.com/Sasye/ApplepieManager) to conveniently manage and configure this plugin.
+
 ## Installation
 
 Copy the following files to the game directory (same folder as `Endfield.exe`):

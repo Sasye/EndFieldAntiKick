@@ -4,6 +4,8 @@
 
 防止《明日方舟：终末地》长时间挂机被服务器踢出。
 
+> 使用 [Applepie Manager](https://github.com/Sasye/ApplepieManager) 来便捷地管理和配置此插件。
+
 ## 安装
 
 将以下文件复制到游戏目录（`Endfield.exe` 所在文件夹）：

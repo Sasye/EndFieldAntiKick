@@ -11,7 +11,6 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -24,9 +23,13 @@ jobs:
       run: |
         mkdir release_pkg
         copy bin\anti_afk.dll release_pkg\
-        copy bin\d3dcompiler_47.dll release_pkg\
-        copy bin\vulkan-1.dll release_pkg\
         copy anti_afk_config.txt release_pkg\
+        copy README.md release_pkg\
+        copy README_EN.md release_pkg\
+        copy LICENSE release_pkg\
+        copy deps\applepie_sdk\LICENSE release_pkg\APPLEPIE_SDK_LICENSE
+        copy deps\applepie_sdk\README.md release_pkg\APPLEPIE_SDK_NOTICE.md
+        copy deps\applepie_sdk\VERSION.json release_pkg\APPLEPIE_SDK_VERSION.json
         Compress-Archive -Path release_pkg\* -DestinationPath "EndfieldAntiKick_${{ github.ref_name }}.zip"
 
     - name: Publish to GitHub Releases

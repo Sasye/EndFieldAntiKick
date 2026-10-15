@@ -1,609 +1,437 @@
-﻿#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#define NOMINMAX
 #define APPLEPIE_PLUGIN_IMPL
-#include "applepie_mgr.h"
-#include "MinHook.h"
-#include <fstream>
-#include <stdlib.h>
-#include <string>
-#include <windows.h>
+#include "applepie_mgr.h" // Legacy metadata/config UI only; lifecycle uses APH.
+#include <applepie_client.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdlib>
+#include <cwchar>
 
-extern "C" __declspec(dllexport) void DummyExport() {}
+static applepie::Client g_client;
+static APH_RuntimeApi g_runtime{};
+static std::atomic<bool> g_stopping{false}, g_ready{false};
+static std::atomic<uint64_t> g_epoch{0};
+// One atomic snapshot: interval in bits 0..7, enabled/debug in bits 8/9.
+static std::atomic<uint32_t> g_config{4u | 0x100u};
+static HANDLE g_cancel = nullptr, g_worker = nullptr;
+static SRWLOCK g_workerLock = SRWLOCK_INIT;
+static wchar_t g_configPath[MAX_PATH]{}, g_logPath[MAX_PATH]{};
 
-// ============================================================================
-// Configuration
-// ============================================================================
-int g_intervalMinutes = 4;
-bool g_enabled = true;
-bool g_debugLog = false;
-static volatile bool g_pluginActive = true;
+static bool RuntimeOpen() {
+  if (g_stopping.load(std::memory_order_acquire)) return false;
+  if (g_runtime.probe_open) return g_runtime.probe_open(g_client.owner()) == APH_OK;
+  APH_RuntimeSnapshot s{};
+  return g_runtime.snapshot && g_runtime.snapshot(sizeof(s), &s) == APH_OK && s.state < APH_RUNTIME_STOPPING;
+}
+static bool EnableOpen(uint64_t epoch) {
+  APH_OwnerStatus s{};
+  return WaitForSingleObject(g_cancel, 0) == WAIT_TIMEOUT && RuntimeOpen() &&
+    g_client.Status(s) == APH_OK && s.state == APH_OWNER_ENABLING && s.activation_epoch == epoch;
+}
+static bool HideEnabled() {
+  return g_ready.load(std::memory_order_acquire) && (g_config.load() & 0x100u);
+}
+static void BeginRuntimeStop() {
+  g_stopping.store(true, std::memory_order_release);
+  g_ready.store(false, std::memory_order_release);
+  if (g_cancel) SetEvent(g_cancel);
+}
 
-// ============================================================================
-// Compatibility & Version Definitions
-// ============================================================================
-// If a game update changes method signatures, update these constants
-#define EXPECTED_GETINSTANCE_PARAMS 0
-#define EXPECTED_GETSENDER_PARAMS 0
-#define EXPECTED_SEND_PARAMS 1
-#define EXPECTED_CTOR_PARAMS 0
-
-// Shutdown event - signaled on DLL_PROCESS_DETACH to wake sleeping threads
-HANDLE g_shutdownEvent = NULL;
-
-void DebugLog(const char *fmt, ...) {
-  if (!g_debugLog)
-    return;
-  char buf[1024];
-  va_list args;
-  va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
-  va_end(args);
-
-  char path[MAX_PATH];
-  GetModuleFileNameA(NULL, path, MAX_PATH);
-  std::string dir(path);
-  size_t pos = dir.find_last_of("\\/");
-  if (pos != std::string::npos)
-    dir = dir.substr(0, pos + 1);
-  std::string logPath = dir + "plugin\\anti_afk_log.txt";
-
-  FILE *f = fopen(logPath.c_str(), "a");
+static bool InitPaths() {
+  wchar_t path[MAX_PATH]{};
+  DWORD size = GetModuleFileNameW(nullptr, path, _countof(path));
+  if (!size || size >= _countof(path)) return false;
+  wchar_t* slash = wcsrchr(path, L'\\');
+  if (!slash) return false;
+  slash[1] = 0;
+  if (wcslen(path) + wcslen(L"plugin\\anti_afk_config.txt") >= _countof(g_configPath)) return false;
+  return swprintf_s(g_configPath, L"%splugin\\anti_afk_config.txt", path) > 0 &&
+         swprintf_s(g_logPath, L"%splugin\\anti_afk_log.txt", path) > 0;
+}
+static void WriteLog(const char* fmt, va_list args) {
+  const DWORD savedError = GetLastError();
+  char buffer[1024];
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  FILE* f = _wfopen(g_logPath, L"a");
   if (f) {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buf);
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buffer);
     fclose(f);
   }
+  SetLastError(savedError);
 }
-
-void LoadConfig() {
-  char path[MAX_PATH];
-  GetModuleFileNameA(NULL, path, MAX_PATH);
-
-  std::string dir(path);
-  size_t pos = dir.find_last_of("\\/");
-  if (pos != std::string::npos)
-    dir = dir.substr(0, pos + 1);
-
-  std::string configPath = dir + "plugin\\anti_afk_config.txt";
-  std::ifstream config(configPath);
-  if (config.is_open()) {
-    std::string line;
-    while (std::getline(config, line)) {
-      if (line.empty() || line[0] == '#' || line[0] == ';')
-        continue;
-      size_t eq = line.find('=');
-      if (eq == std::string::npos)
-        continue;
-      std::string key = line.substr(0, eq);
-      std::string val = line.substr(eq + 1);
-      while (!key.empty() && key.back() == ' ')
-        key.pop_back();
-      while (!val.empty() && val.front() == ' ')
-        val = val.substr(1);
-      if (key == "interval_minutes") {
-        int v = atoi(val.c_str());
-        if (v >= 1 && v <= 30)
-          g_intervalMinutes = v;
-      } else if (key == "enabled") {
-        g_enabled = (val == "1" || val == "true");
-      } else if (key == "debug_log") {
-        g_debugLog = (val == "1" || val == "true");
+static void DiagnosticLog(const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  WriteLog(fmt, args);
+  va_end(args);
+}
+static void DebugLog(const char* fmt, ...) {
+  if (!(g_config.load() & 0x200u)) return;
+  va_list args;
+  va_start(args, fmt);
+  WriteLog(fmt, args);
+  va_end(args);
+}
+static void LoadConfig() {
+  uint32_t config = 4u | 0x100u;
+  FILE* f = _wfopen(g_configPath, L"r");
+  if (f) {
+    char line[512], key[128], value[128];
+    while (fgets(line, sizeof(line), f)) {
+      if (line[0] == '#' || line[0] == ';') continue;
+      if (sscanf(line, " %127[^=]= %127s", key, value) != 2) continue;
+      size_t len = strlen(key);
+      while (len && (key[len - 1] == ' ' || key[len - 1] == '\t')) key[--len] = 0;
+      if (!strcmp(key, "interval_minutes")) {
+        char* end = nullptr;
+        long n = strtol(value, &end, 10);
+        if (end != value && !*end && n >= 1 && n <= 30) config = (config & ~255u) | (uint32_t)n;
+      } else if (!strcmp(key, "enabled") || !strcmp(key, "debug_log")) {
+        uint32_t bit = !strcmp(key, "enabled") ? 0x100u : 0x200u;
+        if (!strcmp(value, "1") || !strcmp(value, "true")) config |= bit;
+        else config &= ~bit;
       }
     }
-    config.close();
+    fclose(f);
   }
+  g_config.store(config, std::memory_order_release);
 }
 
-// ============================================================================
-// Il2Cpp API Definitions
-// ============================================================================
-typedef void *(*Il2CppDomainGet)();
-typedef void *(*Il2CppThreadAttach)(void *domain);
-typedef void *(*Il2CppGetImage)(void *assembly);
-typedef void *(*Il2CppDomainGetAssemblies)(void *domain, size_t *size);
-typedef void *(*Il2CppClassFromName)(void *image, const char *namespaze,
-                                     const char *name);
-typedef void *(*Il2CppClassGetMethodFromName)(void *klass, const char *name,
-                                              int argsCount);
-typedef void *(*Il2CppRuntimeInvoke)(void *method, void *obj, void **params,
-                                     void **exc);
-typedef void *(*Il2CppObjectNew)(void *klass);
-typedef void *(*Il2CppClassGetPropertyFromName)(void *klass, const char *name);
-typedef void *(*Il2CppPropertyGetGetMethod)(void *prop);
-typedef void *(*Il2CppFieldSetValue)(void *obj, void *field, void *value);
-typedef void *(*Il2CppClassGetFieldFromName)(void *klass, const char *name);
-typedef const char *(*Il2CppClassGetName)(void *klass);
-typedef const char *(*Il2CppClassGetNamespace)(void *klass);
+#include "managed_runtime.h"
+#include "managed_hooks.h"
 
-Il2CppDomainGet il2cpp_domain_get;
-Il2CppThreadAttach il2cpp_thread_attach;
-Il2CppDomainGetAssemblies il2cpp_domain_get_assemblies;
-Il2CppClassFromName il2cpp_class_from_name;
-Il2CppClassGetMethodFromName il2cpp_class_get_method_from_name;
-Il2CppRuntimeInvoke il2cpp_runtime_invoke;
-Il2CppGetImage il2cpp_assembly_get_image;
-Il2CppObjectNew il2cpp_object_new;
-Il2CppClassGetPropertyFromName il2cpp_class_get_property_from_name;
-Il2CppPropertyGetGetMethod il2cpp_property_get_get_method;
-Il2CppFieldSetValue il2cpp_field_set_value;
-Il2CppClassGetFieldFromName il2cpp_class_get_field_from_name;
-Il2CppClassGetName il2cpp_class_get_name;
-Il2CppClassGetNamespace il2cpp_class_get_namespace;
-
-HMODULE hGameAssembly = NULL;
-
-// ============================================================================
-// Il2Cpp Resolution
-// ============================================================================
-bool ResolveIl2Cpp() {
-  hGameAssembly = GetModuleHandleW(L"GameAssembly.dll");
-  if (!hGameAssembly)
-    return false;
-
-#define RESOLVE(name)                                                          \
-  name = (decltype(name))GetProcAddress(hGameAssembly, #name);                 \
-  if (!name) {                                                                 \
-    DebugLog("Failed to resolve: %s", #name);                                  \
-    return false;                                                              \
+// Read-only diagnostic probe. Never interpret or follow a rejected branch.
+static bool ReadHookPrefix(APH_NativeProc target, unsigned char (&bytes)[2]) {
+  __try { memcpy(bytes, (const void*)target, sizeof(bytes)); return true; }
+  __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static void LogHookInstall(const char* label, APH_NativeProc target, APH_Result result, uint64_t claim) {
+  const DWORD savedError = GetLastError();
+  HMODULE module = nullptr;
+  if (target) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCWSTR)target, &module);
+  DiagnosticLog("Hook %s target=%p module=%p rva=0x%llx claim=%llu result=%d", label, (void*)target,
+                (void*)module, module ? (unsigned long long)((uintptr_t)target - (uintptr_t)module) : 0,
+                (unsigned long long)claim, result);
+  if (result == APH_E_FOREIGN_PATCH && !claim) {
+    unsigned char bytes[2]{};
+    if (ReadHookPrefix(target, bytes))
+      DiagnosticLog("Rejected entry %s prefix=%02X %02X (no branch traversal)", label, bytes[0], bytes[1]);
   }
-
-  RESOLVE(il2cpp_domain_get);
-  RESOLVE(il2cpp_thread_attach);
-  RESOLVE(il2cpp_domain_get_assemblies);
-  RESOLVE(il2cpp_class_from_name);
-  RESOLVE(il2cpp_class_get_method_from_name);
-  RESOLVE(il2cpp_runtime_invoke);
-  RESOLVE(il2cpp_assembly_get_image);
-  RESOLVE(il2cpp_object_new);
-
-  il2cpp_class_get_property_from_name =
-      (Il2CppClassGetPropertyFromName)GetProcAddress(
-          hGameAssembly, "il2cpp_class_get_property_from_name");
-  il2cpp_property_get_get_method = (Il2CppPropertyGetGetMethod)GetProcAddress(
-      hGameAssembly, "il2cpp_property_get_get_method");
-  il2cpp_field_set_value = (Il2CppFieldSetValue)GetProcAddress(
-      hGameAssembly, "il2cpp_field_set_value");
-  il2cpp_class_get_field_from_name =
-      (Il2CppClassGetFieldFromName)GetProcAddress(
-          hGameAssembly, "il2cpp_class_get_field_from_name");
-  il2cpp_class_get_name = (Il2CppClassGetName)GetProcAddress(
-      hGameAssembly, "il2cpp_class_get_name");
-  il2cpp_class_get_namespace = (Il2CppClassGetNamespace)GetProcAddress(
-      hGameAssembly, "il2cpp_class_get_namespace");
-
-#undef RESOLVE
-  return true;
+  SetLastError(savedError);
 }
 
-// ============================================================================
-// Assembly helpers
-// ============================================================================
-void *FindClassInAssemblies(void **assemblies, size_t count, const char *ns,
-                            const char *name) {
-  for (size_t i = 0; i < count; i++) {
-    void *image = il2cpp_assembly_get_image(assemblies[i]);
-    void *klass = il2cpp_class_from_name(image, ns, name);
-    if (klass)
-      return klass;
-  }
-  return nullptr;
-}
+// Callback-owned fields: reset only after the previous epoch has drained.
+static uint64_t g_nextDue = 0;
+static uint32_t g_timerConfig = 0, g_random = 1;
+static DWORD g_gameThread = 0;
+static HWND g_gameWindow = nullptr;
+static std::atomic_flag g_tickBusy = ATOMIC_FLAG_INIT;
+static uint32_t g_unreleasedRoots[3]{};
+static std::atomic<bool> g_cleanupUncertain{false};
 
-// ============================================================================
-// Anti-AFK core logic
-// ============================================================================
-static void *g_netBusClass = nullptr;
-static void *g_getInstanceMethod = nullptr;
-static void *g_getSenderMethod = nullptr;
-static void *g_sendMethod = nullptr;
-
-// Proto message classes (priority: FRIEND_SYNC > SCENE_REST > PING)
-static void *g_friendSyncClass = nullptr;
-static void *g_sceneRestClass = nullptr;
-static void *g_pingClass = nullptr;
-static void *g_pingField = nullptr;
-static const char *g_activeMsgName = nullptr;
-
-bool ResolveSendMethod(void **assemblies, size_t count) {
-  const char *nsVariants[] = {"Beyond.Network", "Beyond", ""};
-  for (auto ns : nsVariants) {
-    g_netBusClass = FindClassInAssemblies(assemblies, count, ns, "NetBus");
-    if (g_netBusClass) {
-      DebugLog("Found NetBus in namespace: '%s'", ns);
-      break;
-    }
-  }
-  if (!g_netBusClass) {
-    DebugLog("ERROR: Could not find NetBus class");
-    return false;
-  }
-
-  if (il2cpp_class_get_property_from_name && il2cpp_property_get_get_method) {
-    void *prop = il2cpp_class_get_property_from_name(g_netBusClass, "instance");
-    if (prop) {
-      g_getInstanceMethod = il2cpp_property_get_get_method(prop);
-      DebugLog("Found NetBus.instance via property");
-    }
-  }
-  if (!g_getInstanceMethod)
-    g_getInstanceMethod =
-        il2cpp_class_get_method_from_name(g_netBusClass, "get_instance", EXPECTED_GETINSTANCE_PARAMS);
-  if (!g_getInstanceMethod) {
-    DebugLog("ERROR: Could not find NetBus.instance getter");
-    return false;
-  }
-
-  if (il2cpp_class_get_property_from_name && il2cpp_property_get_get_method) {
-    void *prop =
-        il2cpp_class_get_property_from_name(g_netBusClass, "defaultSender");
-    if (prop) {
-      g_getSenderMethod = il2cpp_property_get_get_method(prop);
-      DebugLog("Found NetBus.defaultSender via property");
-    }
-  }
-  if (!g_getSenderMethod)
-    g_getSenderMethod = il2cpp_class_get_method_from_name(
-        g_netBusClass, "get_defaultSender", EXPECTED_GETSENDER_PARAMS);
-  if (!g_getSenderMethod) {
-    DebugLog("ERROR: Could not find NetBus.defaultSender getter");
-    return false;
-  }
-
-  return true;
-}
-
-bool ResolveSenderSendMethod(void *sender) {
-  if (g_sendMethod)
-    return true;
-
-  typedef void *(*Il2CppObjectGetClass)(void *obj);
-  auto il2cpp_object_get_class = (Il2CppObjectGetClass)GetProcAddress(
-      hGameAssembly, "il2cpp_object_get_class");
-
-  if (il2cpp_object_get_class && sender) {
-    void *senderClass = il2cpp_object_get_class(sender);
-    if (senderClass) {
-      if (il2cpp_class_get_name)
-        DebugLog("Sender class: %s", il2cpp_class_get_name(senderClass));
-      g_sendMethod = il2cpp_class_get_method_from_name(senderClass, "Send", EXPECTED_SEND_PARAMS);
-      if (g_sendMethod) {
-        DebugLog("Found sender.Send(msg) method");
-        return true;
-      }
-    }
-  }
-  DebugLog("ERROR: Could not find Send method on sender");
-  return false;
-}
-
-bool ResolveProtoMessages(void **assemblies, size_t count) {
-  // Priority 1: CS_FRIEND_LIST_SIMPLE_SYNC (natural, no context needed)
-  g_friendSyncClass = FindClassInAssemblies(assemblies, count, "Proto",
-                                            "CS_FRIEND_LIST_SIMPLE_SYNC");
-  if (g_friendSyncClass)
-    DebugLog("Found proto: CS_FRIEND_LIST_SIMPLE_SYNC (primary)");
-
-  // Priority 2: CS_SCENE_REST (empty message)
-  g_sceneRestClass =
-      FindClassInAssemblies(assemblies, count, "Proto", "CS_SCENE_REST");
-  if (g_sceneRestClass)
-    DebugLog("Found proto: CS_SCENE_REST (secondary)");
-
-  // Priority 3: CS_PING (may not count as activity)
-  g_pingClass = FindClassInAssemblies(assemblies, count, "Proto", "CS_PING");
-  if (g_pingClass) {
-    DebugLog("Found proto: CS_PING (fallback)");
-    if (il2cpp_class_get_field_from_name)
-      g_pingField = il2cpp_class_get_field_from_name(g_pingClass, "clientTs_");
-  }
-
-  if (!g_friendSyncClass && !g_sceneRestClass && !g_pingClass) {
-    DebugLog("ERROR: Could not find any suitable proto message class");
-    return false;
-  }
-  return true;
-}
-
-bool SendAntiAFKPacket() {
-  // Plugin Manager: skip sending when paused
-  if (!g_pluginActive) {
-    DebugLog("Anti-AFK paused by Plugin Manager");
-    return true;
-  }
-
-  void *netBusInstance =
-      il2cpp_runtime_invoke(g_getInstanceMethod, nullptr, nullptr, nullptr);
-  if (!netBusInstance) {
-    DebugLog("NetBus.instance returned null");
-    return false;
-  }
-
-  void *sender = il2cpp_runtime_invoke(g_getSenderMethod, netBusInstance,
-                                       nullptr, nullptr);
-  if (!sender) {
-    DebugLog("NetBus.defaultSender returned null (not connected?)");
-    return false;
-  }
-
-  if (!ResolveSenderSendMethod(sender))
-    return false;
-
-  void *msg = nullptr;
-
-  if (g_friendSyncClass) {
-    msg = il2cpp_object_new(g_friendSyncClass);
-    if (msg) {
-      void *ctor =
-          il2cpp_class_get_method_from_name(g_friendSyncClass, ".ctor", EXPECTED_CTOR_PARAMS);
-      if (ctor)
-        il2cpp_runtime_invoke(ctor, msg, nullptr, nullptr);
-      g_activeMsgName = "CS_FRIEND_LIST_SIMPLE_SYNC";
-    }
-  } else if (g_sceneRestClass) {
-    msg = il2cpp_object_new(g_sceneRestClass);
-    if (msg) {
-      void *ctor =
-          il2cpp_class_get_method_from_name(g_sceneRestClass, ".ctor", EXPECTED_CTOR_PARAMS);
-      if (ctor)
-        il2cpp_runtime_invoke(ctor, msg, nullptr, nullptr);
-      g_activeMsgName = "CS_SCENE_REST";
-    }
-  } else if (g_pingClass) {
-    msg = il2cpp_object_new(g_pingClass);
-    if (msg) {
-      void *ctor = il2cpp_class_get_method_from_name(g_pingClass, ".ctor", EXPECTED_CTOR_PARAMS);
-      if (ctor)
-        il2cpp_runtime_invoke(ctor, msg, nullptr, nullptr);
-      if (g_pingField && il2cpp_field_set_value) {
-        ULONGLONG ts = GetTickCount64();
-        il2cpp_field_set_value(msg, g_pingField, &ts);
-      }
-      g_activeMsgName = "CS_PING";
-    }
-  }
-
-  if (!msg) {
-    DebugLog("Failed to create proto message");
-    return false;
-  }
-
-  void *sendParams[] = {msg};
-  void *exc = nullptr;
-  
-  __try {
-    il2cpp_runtime_invoke(g_sendMethod, sender, sendParams, &exc);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    DebugLog("ERROR: SEH Exception caught during g_sendMethod invocation! Ignored to prevent crash.");
-    return false;
-  }
-
-  if (exc) {
-    DebugLog("Send threw an exception");
-    return false;
-  }
-
-  DebugLog("Sent %s successfully", g_activeMsgName);
-  return true;
-}
-
-// ============================================================================
-// Stealth: Hide DLL from file system scans
-// ============================================================================
-typedef HANDLE(WINAPI *CREATE_FILE_W)(LPCWSTR, DWORD, DWORD,
-                                      LPSECURITY_ATTRIBUTES, DWORD, DWORD,
-                                      HANDLE);
-static CREATE_FILE_W p_CreateFileW = NULL;
-typedef DWORD(WINAPI *GET_FILE_ATTRIBUTES_W)(LPCWSTR);
-static GET_FILE_ATTRIBUTES_W p_GetFileAttributesW = NULL;
-
-bool ShouldHide(LPCWSTR name) {
-  if (!name)
-    return false;
-  std::wstring n(name);
-  for (auto &c : n)
-    c = towlower(c);
-  return (n.find(L"anti_afk.dll") != std::wstring::npos);
-}
-
-HANDLE WINAPI h_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess,
-                            DWORD dwShareMode,
-                            LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-                            DWORD dwCreationDisposition,
-                            DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
-  if (ShouldHide(lpFileName)) {
-    SetLastError(ERROR_FILE_NOT_FOUND);
-    return INVALID_HANDLE_VALUE;
-  }
-  return p_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode,
-                       lpSecurityAttributes, dwCreationDisposition,
-                       dwFlagsAndAttributes, hTemplateFile);
-}
-
-DWORD WINAPI h_GetFileAttributesW(LPCWSTR lpFileName) {
-  if (ShouldHide(lpFileName)) {
-    SetLastError(ERROR_FILE_NOT_FOUND);
-    return INVALID_FILE_ATTRIBUTES;
-  }
-  return p_GetFileAttributesW(lpFileName);
-}
-
-// ============================================================================
-// Main anti-AFK thread
-// ============================================================================
-static void *g_domain = nullptr;
-
-DWORD WINAPI AntiAFKThread(LPVOID lpParam) {
-  DebugLog("Anti-AFK thread started, interval=%d minutes", g_intervalMinutes);
-
-  // Wait for game init (interruptible via shutdown event)
-  if (WaitForSingleObject(g_shutdownEvent, 30000) == WAIT_OBJECT_0) {
-    DebugLog("Shutdown during init wait");
-    return 0;
-  }
-
-  if (!ResolveIl2Cpp()) {
-    DebugLog("Failed to resolve Il2Cpp APIs");
-    return 1;
-  }
-  DebugLog("Il2Cpp APIs resolved");
-
-  // Resolve il2cpp_thread_detach
-  typedef void (*Il2CppThreadDetach)(void *thread);
-  auto il2cpp_thread_detach =
-      (Il2CppThreadDetach)GetProcAddress(hGameAssembly, "il2cpp_thread_detach");
-
-  g_domain = il2cpp_domain_get();
-  if (!g_domain) {
-    DebugLog("Failed to get Il2Cpp domain");
-    return 1;
-  }
-
-  // Attach to resolve classes, then detach
-  void *thread = (void *)il2cpp_thread_attach(g_domain);
-
-  size_t asmCount = 0;
-  void **assemblies =
-      (void **)il2cpp_domain_get_assemblies(g_domain, &asmCount);
-  if (!assemblies || asmCount == 0) {
-    DebugLog("Failed to get assemblies");
-    if (il2cpp_thread_detach && thread)
-      il2cpp_thread_detach(thread);
-    return 1;
-  }
-  DebugLog("Found %zu assemblies", asmCount);
-
-  if (!ResolveSendMethod(assemblies, asmCount)) {
-    DebugLog("Failed to resolve send method chain");
-    if (il2cpp_thread_detach && thread)
-      il2cpp_thread_detach(thread);
-    return 1;
-  }
-
-  if (!ResolveProtoMessages(assemblies, asmCount)) {
-    DebugLog("Failed to resolve proto messages");
-    if (il2cpp_thread_detach && thread)
-      il2cpp_thread_detach(thread);
-    return 1;
-  }
-
-  // Detach after init - sleep in detached state so Il2Cpp won't wait for us
-  if (il2cpp_thread_detach && thread)
-    il2cpp_thread_detach(thread);
-
-  DebugLog("All resolved, entering main loop (using %s)",
-           g_friendSyncClass  ? "CS_FRIEND_LIST_SIMPLE_SYNC"
-           : g_sceneRestClass ? "CS_SCENE_REST"
-                              : "CS_PING");
-
-  // Main loop with randomized interval
-  srand((unsigned int)GetTickCount());
-  DWORD baseMs = g_intervalMinutes * 60 * 1000;
-  while (true) {
-    DWORD jitter = baseMs * 30 / 100;
-    DWORD intervalMs = baseMs - jitter + (rand() % (jitter * 2 + 1));
-    DebugLog("Next packet in %lu seconds", intervalMs / 1000);
-    DWORD waitResult = WaitForSingleObject(g_shutdownEvent, intervalMs);
-    if (waitResult == WAIT_OBJECT_0)
-      break;
-
-    // Attach briefly just for the send, then detach
-    void *t = (void *)il2cpp_thread_attach(g_domain);
-    __try {
-      SendAntiAFKPacket();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      DebugLog("ERROR: SEH Exception caught inside SendAntiAFKPacket routine! Recovering safely.");
-    }
-    if (il2cpp_thread_detach && t)
-      il2cpp_thread_detach(t);
-  }
-
-  DebugLog("Anti-AFK thread exiting cleanly");
-  return 0;
-}
-
-// ============================================================================
-// DLL Entry Point
-// ============================================================================
-static HANDLE g_thread = NULL;
-
-void Setup() {
-  HANDLE hMutex = CreateMutexA(
-      NULL, TRUE, "Local\\ArknightsEndfield_AntiAFK_InstanceGuard");
-  if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    if (hMutex)
-      CloseHandle(hMutex);
-    return;
-  }
-
-  LoadConfig();
-  if (!g_enabled)
-    return;
-
-  DebugLog("=== Anti-AFK DLL Loaded ===");
-  DebugLog("Interval: %d minutes", g_intervalMinutes);
-
-  g_shutdownEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-
-  // Install stealth hooks to hide anti_afk.dll from file scans
-  MH_Initialize();
-  MH_CreateHookApi(L"kernelbase.dll", "CreateFileW", (LPVOID)h_CreateFileW,
-                   (LPVOID *)&p_CreateFileW);
-  MH_CreateHookApi(L"kernelbase.dll", "GetFileAttributesW",
-                   (LPVOID)h_GetFileAttributesW,
-                   (LPVOID *)&p_GetFileAttributesW);
-  MH_EnableHook(MH_ALL_HOOKS);
-  DebugLog("Stealth hooks installed");
-
-  g_thread = CreateThread(NULL, 0, AntiAFKThread, NULL, 0, NULL);
-}
-
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
-  if (reason == DLL_PROCESS_ATTACH) {
-    DisableThreadLibraryCalls(hModule);
-    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Setup, NULL, 0, NULL);
-  } else if (reason == DLL_PROCESS_DETACH) {
-    if (reserved != NULL)
-      return TRUE; // process terminating, skip cleanup
-
-    if (g_shutdownEvent)
-      SetEvent(g_shutdownEvent);
-    if (g_thread) {
-      WaitForSingleObject(g_thread, 2000);
-      CloseHandle(g_thread);
-    }
-    if (g_shutdownEvent)
-      CloseHandle(g_shutdownEvent);
+static BOOL CALLBACK FindUnityWindow(HWND window, LPARAM result) {
+  DWORD process = 0;
+  GetWindowThreadProcessId(window, &process);
+  wchar_t name[64]{};
+  if (process == GetCurrentProcessId() && GetClassNameW(window, name, _countof(name)) &&
+      wcscmp(name, L"UnityWndClass") == 0) {
+    *(HWND*)result = window;
+    return FALSE;
   }
   return TRUE;
 }
+static bool GameThreadVerified() {
+  const DWORD current = GetCurrentThreadId();
+  if (g_gameWindow && IsWindow(g_gameWindow) && GetWindowThreadProcessId(g_gameWindow, nullptr) == current)
+    return g_gameThread == current && g_il.thread_current() != nullptr;
+  HWND window = nullptr;
+  EnumThreadWindows(current, FindUnityWindow, (LPARAM)&window);
+  if (!window || !g_il.thread_current()) return false;
+  g_gameWindow = window;
+  g_gameThread = current;
+  return true;
+}
+static DWORD NextInterval(uint32_t config) {
+  g_random ^= g_random << 13; g_random ^= g_random >> 17; g_random ^= g_random << 5;
+  const DWORD base = (config & 255u) * 60000u;
+  const DWORD jitter = base * 30u / 100u;
+  return base - jitter + g_random % (jitter * 2u + 1u);
+}
+static void ReleaseRoots(uint32_t (&roots)[3]) {
+  __try {
+    for (unsigned i = 3; i > 0; --i) {
+      if (!roots[i - 1]) continue;
+      if (!RuntimeOpen()) break;
+      g_il.gchandle_free(roots[i - 1]);
+      roots[i - 1] = 0;
+    }
+  } __finally {
+    // A shutdown or native cleanup fault forbids further VM calls. Keep the
+    // handles as evidence until process exit; never claim a clean hot disable.
+    bool retained = false;
+    for (unsigned i = 0; i < 3; ++i) if (roots[i]) {
+      g_unreleasedRoots[i] = roots[i]; retained = true;
+    }
+    if (retained) g_cleanupUncertain.store(true, std::memory_order_release);
+  }
+}
 
-// ============================================================================
-// Plugin Manager Interface
-// ============================================================================
-static AP_PluginInfo s_pluginInfo = {
-    APPLEPIE_PLUGIN_API_VERSION,
-    "anti_afk",
-    "Anti-AFK",
-    "Prevent AFK detection kick",
-    "anti_afk_config.txt",
-    true  // supports hot disable
+static bool SendAntiAFKPacket() {
+  if (!HideEnabled() || !RuntimeOpen()) return false;
+  // Roots protect borrowed results across subsequent managed allocations.
+  // No object, sender or session survives a normal callback. Failed root
+  // cleanup is retained separately until process exit.
+  uint32_t roots[3]{};
+  bool sent = false;
+  __try {
+    void* bus = ReadNetBus();
+    if (!bus) return false;
+    roots[0] = g_il.gchandle_new(bus, true);
+    if (!roots[0] || g_il.object_get_class(bus) != g_net.netBus) return false;
+    bool valid = false;
+    int32_t session = 0;
+    if (!InvokeValue(g_net.validateSession, bus, valid) || !valid ||
+        !InvokeValue(g_net.sessionId, bus, session)) return false;
+    void* sender = nullptr;
+    if (!Invoke(g_net.sender, bus, nullptr, &sender) || !sender) return false;
+    roots[1] = g_il.gchandle_new(sender, true);
+    if (!roots[1]) return false;
+    void* senderClass = g_il.object_get_class(sender);
+    void* send = FindMethod(senderClass, "Send", false, "Beyond.Network.NetBus.ResultHandler", "Google.Protobuf.IMessage");
+    if (!send || !ReferenceType(g_il.method_get_return_type(send)) ||
+        !ReferenceType(g_il.method_get_param(send, 0))) {
+      DebugLog("Sender.Send has an unsupported signature"); return false;
+    }
+    const ProtoMessage* proto = nullptr;
+    for (const auto& candidate : g_net.messages) if (candidate.klass) { proto = &candidate; break; }
+    if (!proto || !g_il.class_is_assignable_from(g_il.class_from_type(g_il.method_get_param(send, 0)), proto->klass))
+      return false;
+    if (!HideEnabled() || !RuntimeOpen()) return false;
+    void* message = g_il.object_new(proto->klass);
+    if (!message) return false;
+    roots[2] = g_il.gchandle_new(message, true);
+    if (!roots[2] || !Invoke(proto->ctor, message, nullptr, nullptr)) return false;
+    if (proto->timestamp) {
+      if (!RuntimeOpen()) return false;
+      uint64_t timestamp = GetTickCount64();
+      // Newly created, not yet shared protobuf; no Animation/Camera write.
+      g_il.field_set_value(message, proto->timestamp, &timestamp);
+    }
+    int32_t currentSession = 0;
+    void* currentBus = ReadNetBus();
+    void* currentSender = nullptr;
+    if (currentBus != bus ||
+        !Invoke(g_net.sender, bus, nullptr, &currentSender) || currentSender != sender ||
+        !InvokeValue(g_net.sessionId, bus, currentSession) || currentSession != session ||
+        !InvokeValue(g_net.validateSession, bus, valid) || !valid || !HideEnabled()) return false;
+    void* args[] = {message};
+    if (!Invoke(send, sender, args, nullptr)) {
+      // The send may already have been submitted. Never replay an uncertain
+      // external operation; pause until an explicit new enable epoch.
+      DebugLog("Send outcome uncertain; disabling without replay or rollback");
+      g_ready.store(false);
+      g_client.Disable();
+      return false;
+    }
+    sent = true;
+    DebugLog("Sent %s successfully (session=%d)", proto->name, session);
+  } __finally {
+    ReleaseRoots(roots);
+  }
+  return sent;
+}
+
+static APH_Result APH_CALL OnUpdate(APH_Owner, const APH_SharedEvent* event, void*) {
+  if (!event || event->phase != APH_AFTER || event->payload_bytes != sizeof(UpdatePayload) ||
+      event->activation_epoch != g_epoch.load() || !g_ready.load(std::memory_order_acquire)) return APH_OK;
+  const auto& p = *(const UpdatePayload*)event->payload;
+  if (!p.self || g_stopping.load()) return APH_OK;
+  if (g_tickBusy.test_and_set(std::memory_order_acquire)) return APH_OK;
+  __try {
+  const uint32_t config = g_config.load(std::memory_order_acquire);
+  const uint64_t now = GetTickCount64();
+  if (config != g_timerConfig) {
+    g_timerConfig = config;
+    g_nextDue = now + NextInterval(config);
+  }
+  if (!(config & 0x100u) || now < g_nextDue) return APH_OK;
+  // Only due work uses runtime APIs/reflection; no per-frame service lookup,
+  // install polling, metadata scans, allocations or file I/O.
+  if (!RuntimeOpen() || !GameThreadVerified()) return APH_OK;
+  g_nextDue = now + NextInterval(config);
+  int32_t state = 0;
+  if (!InvokeValue(g_app.currentState, p.self, state) || state != g_app.mainState) return APH_OK;
+  if (!g_net.netBus) {
+    void* domain = g_il.domain_get();
+    size_t count = 0;
+    void** assemblies = domain ? g_il.domain_get_assemblies(domain, &count) : nullptr;
+    if (!assemblies || !count || !ResolveNetworkMetadata(assemblies, count)) {
+      DiagnosticLog("Network metadata unavailable after GameState.Main; disabling this epoch");
+      g_ready.store(false, std::memory_order_release);
+      g_client.Disable();
+      return APH_OK;
+    }
+    DiagnosticLog("GameState.Main confirmed; network metadata ready on game thread (singleton field)");
+  }
+  SendAntiAFKPacket();
+  return APH_OK;
+  } __finally { g_tickBusy.clear(std::memory_order_release); }
+}
+
+static APH_Result Initialize(uint64_t epoch) {
+  while (EnableOpen(epoch) && !ResolveIl2Cpp()) {
+    if (GetTickCount64() >= g_enableDeadline) return APH_E_UNAVAILABLE;
+    WaitForSingleObject(g_cancel, 50);
+  }
+  if (!EnableOpen(epoch)) return APH_E_REVOKED;
+  APH_NativeProc shutdown = (APH_NativeProc)GetProcAddress(g_gameAssembly, "il2cpp_shutdown");
+  APH_Result result = APH_OK;
+  if (shutdown) {
+    result = ShutdownHook::Install(epoch, shutdown, "void() C-export", "il2cpp.runtime.shutdown");
+    LogHookInstall("il2cpp_shutdown", shutdown, result, ShutdownHook::hook.handle());
+    if (result != APH_OK) {
+      // Core deliberately rejects existing branches, including export thunks.
+      // Only a rejection BEFORE registration may use the other stop boundary.
+      // An existing claim/backend failure still aborts this enable.
+      if (result != APH_E_FOREIGN_PATCH || ShutdownHook::hook.handle()) return result;
+      DiagnosticLog("Shutdown entry refused before registration; requiring validated ApplicationQuit");
+    }
+  } else {
+    DiagnosticLog("Shutdown export absent; requiring validated ApplicationQuit");
+  }
+  DiagnosticLog("Waiting for IL2CPP worker readiness (corlib + registered VM thread)");
+  while (EnableOpen(epoch) && !WorkerAttachReady()) {
+    if (GetTickCount64() >= g_enableDeadline) {
+      DiagnosticLog("IL2CPP worker readiness timed out before domain/attach/metadata access");
+      return APH_E_UNAVAILABLE;
+    }
+    WaitForSingleObject(g_cancel, 50);
+  }
+  if (!EnableOpen(epoch)) return APH_E_REVOKED;
+  DiagnosticLog("IL2CPP worker readiness confirmed; discovering lifecycle only, network waits for GameState.Main");
+  bool resolved = false;
+  while (EnableOpen(epoch) && !resolved) {
+    if (GetTickCount64() >= g_enableDeadline) return APH_E_SIGNATURE;
+    void* domain = g_il.domain_get();
+    void* thread = domain ? g_il.thread_attach(domain) : nullptr;
+    if (thread) {
+      __try {
+        size_t count = 0;
+        void** assemblies = g_il.domain_get_assemblies(domain, &count);
+        if (assemblies && count && EnableOpen(epoch)) resolved = ResolveLifecycleMetadata(assemblies, count);
+      } __finally { if (RuntimeOpen()) g_il.thread_detach(thread); }
+    }
+    if (!resolved) WaitForSingleObject(g_cancel, 50);
+  }
+  if (!EnableOpen(epoch)) return APH_E_REVOKED;
+  const APH_NativeProc quit = NativeAddress(g_app.quit);
+  result = QuitHook::Install(epoch, quit, "void(MethodInfo*) static", "unity.Application.Internal_ApplicationQuit");
+  LogHookInstall("Application.Internal_ApplicationQuit", quit, result, QuitHook::hook.handle());
+  if (result != APH_OK) return result;
+  DiagnosticLog("Stop boundaries: shutdown=%d applicationQuit=1", ShutdownHook::hook.handle() ? 1 : 0);
+  const APH_NativeProc update = NativeAddress(g_app.update);
+  result = UpdateHook::Install(epoch, update);
+  LogHookInstall("GameApp.Update", update, result, UpdateHook::hook.handle());
+  if (result != APH_OK) return result;
+  HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+  auto createFile = (decltype(&CreateFileW))GetProcAddress(kernelbase, "CreateFileW");
+  auto attributes = (decltype(&GetFileAttributesW))GetProcAddress(kernelbase, "GetFileAttributesW");
+  result = CreateFileHook::Install(epoch, createFile,
+      "HANDLE WINAPI(LPCWSTR,DWORD,DWORD,LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE)", "kernelbase.CreateFileW");
+  LogHookInstall("KernelBase.CreateFileW", (APH_NativeProc)createFile, result, CreateFileHook::hook.handle());
+  if (result != APH_OK) return result;
+  result = AttributesHook::Install(epoch, attributes, "DWORD WINAPI(LPCWSTR)", "kernelbase.GetFileAttributesW");
+  LogHookInstall("KernelBase.GetFileAttributesW", (APH_NativeProc)attributes, result, AttributesHook::hook.handle());
+  return result;
+}
+static DWORD WINAPI InitializeWorker(void* argument) {
+  const uint64_t epoch = (uint64_t)(uintptr_t)argument;
+  const APH_Result result = Initialize(epoch);
+  if (result == APH_OK && EnableOpen(epoch)) g_ready.store(true, std::memory_order_release);
+  const APH_Result completed = g_client.CompleteEnable(epoch, result);
+  if (completed != APH_OK) g_ready.store(false, std::memory_order_release);
+  DiagnosticLog("Enable epoch=%llu result=%d completion=%d", (unsigned long long)epoch, result, completed);
+  return 0;
+}
+static void APH_CALL Disabling(APH_Owner, uint64_t, void*) {
+  AcquireSRWLockExclusive(&g_workerLock);
+  g_ready.store(false, std::memory_order_release);
+  SetEvent(g_cancel);
+  ReleaseSRWLockExclusive(&g_workerLock);
+}
+static APH_Result APH_CALL Restore(APH_Owner, const APH_Cleanup* cleanup, void*) {
+  if (!cleanup || cleanup->domains) return APH_E_ARGUMENT;
+  AcquireSRWLockExclusive(&g_workerLock);
+  __try {
+    if (g_worker) {
+      const DWORD state = WaitForSingleObject(g_worker, 0);
+      if (state == WAIT_TIMEOUT) return APH_PENDING;
+      if (state != WAIT_OBJECT_0) return APH_E_NEEDS_RESTART;
+      CloseHandle(g_worker); g_worker = nullptr;
+    }
+    if (g_cleanupUncertain.load(std::memory_order_acquire)) return APH_E_NEEDS_RESTART;
+    APH_Result result = UpdateHook::listener.Close();
+    if (result != APH_OK) return result == APH_E_BUSY ? APH_PENDING : result;
+    g_app = {}; g_net = {};
+    g_gameWindow = nullptr; g_gameThread = 0;
+    g_nextDue = 0; g_timerConfig = 0;
+    return APH_OK;
+  } __finally { ReleaseSRWLockExclusive(&g_workerLock); }
+}
+
+extern "C" __declspec(dllexport) const APH_Manifest APH_PluginManifest = {
+  sizeof(APH_Manifest), APH_ABI_MAJOR, APH_ABI_MINOR, APH_ARCH_X64,
+  APH_PLUGIN_LIFECYCLE | APH_PLUGIN_LATE_LOAD | APH_PLUGIN_MODULE_OBSERVER,
+  APH_CAP_CORE | APH_CAP_HOOKS, 0, "anti_afk", "Anti-AFK"
 };
-
-APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() {
-    return &s_pluginInfo;
+extern "C" __declspec(dllexport) APH_Result APH_CALL APH_Attach(const APH_AttachArgs* args) {
+  if (g_cancel) return APH_E_DUPLICATE;
+  APH_Result result = g_client.Attach(args);
+  if (result != APH_OK) return result;
+  result = g_client.Service(g_runtime);
+  if (result != APH_OK) return result;
+  if (!InitPaths()) return APH_E_UNAVAILABLE;
+  g_cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!g_cancel) return APH_E_UNAVAILABLE;
+  const APH_LifecycleDesc lifecycle{sizeof(lifecycle), 60000, Disabling, Restore, nullptr};
+  result = g_client.RegisterLifecycle(lifecycle);
+  if (result != APH_OK) { CloseHandle(g_cancel); g_cancel = nullptr; }
+  return result;
 }
-
-APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
-    g_pluginActive = true;
-    return true;
-}
-
-APPLEPIE_PLUGIN_EXPORT bool AP_PluginDisable() {
-    g_pluginActive = false;
-    return true;
-}
-
-APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() {
+extern "C" __declspec(dllexport) APH_Result APH_CALL APH_Enable(APH_Owner owner, uint64_t epoch) {
+  if (owner != g_client.owner() || !epoch) return APH_E_ARGUMENT;
+  AcquireSRWLockExclusive(&g_workerLock);
+  __try {
+    APH_OwnerStatus status{};
+    APH_Result statusResult = g_client.Status(status);
+    if (statusResult != APH_OK) return statusResult;
+    if (status.state != APH_OWNER_ENABLING || status.activation_epoch != epoch) return APH_E_STALE;
+    if (!RuntimeOpen()) return APH_E_REVOKED;
+    if (g_worker) {
+      if (WaitForSingleObject(g_worker, 0) != WAIT_OBJECT_0) return APH_E_BUSY;
+      CloseHandle(g_worker); g_worker = nullptr;
+    }
     LoadConfig();
-    return true;
+    ResetEvent(g_cancel);
+    g_epoch.store(epoch);
+    g_ready.store(false);
+    g_timerConfig = 0; g_nextDue = 0;
+    g_random = (uint32_t)(GetTickCount64() ^ epoch) | 1u;
+    g_enableDeadline = GetTickCount64() + 45000;
+    g_worker = CreateThread(nullptr, 0, InitializeWorker, (void*)(uintptr_t)epoch, 0, nullptr);
+    return g_worker ? APH_PENDING : APH_E_UNAVAILABLE;
+  } __finally { ReleaseSRWLockExclusive(&g_workerLock); }
 }
+
+static AP_PluginInfo s_pluginInfo = {
+  APPLEPIE_PLUGIN_API_VERSION, "anti_afk", "Anti-AFK", "Prevent AFK detection kick",
+  "anti_afk_config.txt", true
+};
+APPLEPIE_PLUGIN_EXPORT AP_PluginInfo* AP_GetPluginInfo() { return &s_pluginInfo; }
+APPLEPIE_PLUGIN_EXPORT bool AP_ReloadConfig() { LoadConfig(); return true; }
+extern "C" __declspec(dllexport) void DummyExport() {}
+BOOL WINAPI DllMain(HMODULE, DWORD, void*) { return TRUE; }

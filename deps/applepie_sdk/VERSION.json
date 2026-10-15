@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "source_repository": "https://github.com/Sasye/ApplepieManager",
+  "source_commit": "e5facbf7f3716f8abff2025061819983fcebb0f3",
+  "source_directory": "sdk",
+  "abi": "1.1",
+  "captured_on": "2026-10-15",
+  "modified": false,
+  "files": {
+    "applepie.h": "c2c54171c0cab687aed2f8553baaf9b7a4cce75f88a5c4bc80aa60d8d82822ab",
+    "applepie_client.h": "7d16ef59274d606386934243436f534c44c68b625d46bb19c0c51f1cba307259",
+    "applepie_native.h": "b08a66ee91cad1d7ecb000015236d5f348b5bb0aa7b8959614b9a7086fc5a161",
+    "applepie_seh.h": "31fdf14705c3d21f78f67c36480531ad6ec8b1724e6903dff75919cd3a193a25",
+    "applepie_pointer_scope.h": "688f865ab7bb3e5524abe7635abee37608ae17468909a70146502ac7703177b4",
+    "LICENSE": "e0a3f026ecbeca1edf76067897fb937f6ac83c900b850c4e976423b332464538"
+  }
+}

@@ -1,0 +1,3 @@
+# Preserve the vendored SDK bytes recorded in VERSION.json on every checkout.
+deps/applepie_sdk/*.h -text
+deps/applepie_sdk/LICENSE -text

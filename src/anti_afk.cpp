@@ -57,7 +57,8 @@ static void WriteLog(const char* fmt, va_list args) {
   FILE* f = _wfopen(g_logPath, L"a");
   if (f) {
     SYSTEMTIME st{}; GetLocalTime(&st);
-    fprintf(f, "[%02d:%02d:%02d] %s\n", st.wHour, st.wMinute, st.wSecond, buffer);
+    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] [pid=%lu] %s\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, GetCurrentProcessId(), buffer);
     fclose(f);
   }
   SetLastError(savedError);
@@ -189,22 +190,26 @@ static bool SendAntiAFKPacket() {
   bool sent = false;
   __try {
     void* bus = ReadNetBus();
-    if (!bus) return false;
+    if (!bus) { DebugLog("Keepalive skipped: NetBus instance unavailable"); return false; }
     roots[0] = g_il.gchandle_new(bus, true);
     if (!roots[0] || g_il.object_get_class(bus) != g_net.netBus) return false;
     bool valid = false;
     int32_t session = 0;
     if (!InvokeValue(g_net.validateSession, bus, valid) || !valid ||
-        !InvokeValue(g_net.sessionId, bus, session)) return false;
+        !InvokeValue(g_net.sessionId, bus, session)) {
+      DebugLog("Keepalive skipped: network session unavailable"); return false;
+    }
     void* sender = nullptr;
-    if (!Invoke(g_net.sender, bus, nullptr, &sender) || !sender) return false;
+    if (!Invoke(g_net.sender, bus, nullptr, &sender) || !sender) {
+      DebugLog("Keepalive skipped: default sender unavailable"); return false;
+    }
     roots[1] = g_il.gchandle_new(sender, true);
     if (!roots[1]) return false;
     void* senderClass = g_il.object_get_class(sender);
-    void* send = FindMethod(senderClass, "Send", false, "Beyond.Network.NetBus.ResultHandler", "Google.Protobuf.IMessage");
-    if (!send || !ReferenceType(g_il.method_get_return_type(send)) ||
-        !ReferenceType(g_il.method_get_param(send, 0))) {
-      DebugLog("Sender.Send has an unsupported signature"); return false;
+    void* send = FindSenderSend(senderClass, g_net.messageInterface);
+    if (!send || g_il.class_from_type(g_il.method_get_param(send, 0)) != g_net.messageClass) {
+      DiagnosticLog("Keepalive skipped: concrete Sender.Send(%s) signature mismatch", g_net.messageInterface);
+      return false;
     }
     const ProtoMessage* proto = nullptr;
     for (const auto& candidate : g_net.messages) if (candidate.klass) { proto = &candidate; break; }
@@ -238,7 +243,8 @@ static bool SendAntiAFKPacket() {
       return false;
     }
     sent = true;
-    DebugLog("Sent %s successfully (session=%d)", proto->name, session);
+    DebugLog("Send returned for %s (interface=%s session=%d; server acknowledgement not observed)",
+             proto->name, g_net.messageInterface, session);
   } __finally {
     ReleaseRoots(roots);
   }

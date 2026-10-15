@@ -43,6 +43,7 @@ static Il2CppApi g_il{};
 static HMODULE g_gameAssembly = nullptr;
 static bool RuntimeOpen();
 static void DebugLog(const char*, ...);
+static void DiagnosticLog(const char*, ...);
 
 static bool ResolveIl2Cpp() {
   HMODULE module = GetModuleHandleW(L"GameAssembly.dll");
@@ -184,9 +185,22 @@ struct NetworkMetadata {
   void* sender;
   void* validateSession;
   void* sessionId;
+  const char* messageInterface;
+  void* messageClass;
   ProtoMessage messages[3];
 };
 static NetworkMetadata g_net{};
+
+static bool NetworkMetadataError(const char* reason) {
+  DiagnosticLog("Network metadata unsupported: %s", reason);
+  return false;
+}
+
+static void* FindSenderSend(void* senderClass, const char* messageInterface) {
+  void* send = FindMethod(senderClass, "Send", false, "Beyond.Network.NetBus.ResultHandler", messageInterface);
+  return send && ReferenceType(g_il.method_get_return_type(send)) &&
+    ReferenceType(g_il.method_get_param(send, 0)) ? send : nullptr;
+}
 
 // Call only after GameState.Main is confirmed in a due GameApp.Update callback.
 static bool ResolveNetworkMetadata(void** assemblies, size_t count) {
@@ -197,7 +211,7 @@ static bool ResolveNetworkMetadata(void** assemblies, size_t count) {
     n.netBus = FindClass(assemblies, count, ns, "NetBus");
     if (n.netBus) break;
   }
-  if (!n.netBus) return false;
+  if (!n.netBus) return NetworkMetadataError("NetBus class not found");
   // Read the initialized singleton field; do not enumerate or invoke methods
   // on ExplicitSingleton<NetBus>. Its generic method setup is unsafe during
   // early startup in the affected game build (OnInit/get_instance AOT errors).
@@ -206,7 +220,8 @@ static bool ResolveNetworkMetadata(void** assemblies, size_t count) {
     if (!field) continue;
     void* type = g_il.field_get_type(field);
     if ((g_il.field_get_flags(field) & 0x50u) != 0x10u || !ReferenceType(type) ||
-        g_il.class_from_type(type) != n.netBus) return false;
+        g_il.class_from_type(type) != n.netBus)
+      return NetworkMetadataError("NetBus singleton field flags/type mismatch");
     n.instanceField = field;
     break;
   }
@@ -214,27 +229,55 @@ static bool ResolveNetworkMetadata(void** assemblies, size_t count) {
                         "Beyond.Network.DisposableBusSender");
   n.validateSession = FindDeclaredMethod(n.netBus, "_ValidateSession", false, "System.Boolean");
   n.sessionId = FindDeclaredMethod(n.netBus, "get_currentSessionID", false, "System.Int32");
-  if (!n.instanceField || !n.sender || !n.validateSession || !n.sessionId ||
-      !ReferenceType(g_il.method_get_return_type(n.sender))) return false;
+  if (!n.instanceField) return NetworkMetadataError("NetBus singleton field missing");
+  if (!n.sender || !ReferenceType(g_il.method_get_return_type(n.sender)))
+    return NetworkMetadataError("NetBus.get_defaultSender signature mismatch");
+  if (!n.validateSession) return NetworkMetadataError("NetBus._ValidateSession signature mismatch");
+  if (!n.sessionId) return NetworkMetadataError("NetBus.get_currentSessionID signature mismatch");
+
+  // The October update uses protobuf-net. Select by the exact Send signature,
+  // not by whether a protobuf assembly happens to be loaded in the process.
+  void* senderClass = g_il.class_from_type(g_il.method_get_return_type(n.sender));
+  const char* interfaces[] = {"ProtoBuf.IExtensible", "Google.Protobuf.IMessage"};
+  for (const char* name : interfaces) {
+    void* send = FindSenderSend(senderClass, name);
+    if (!send) continue;
+    if (n.messageInterface) return NetworkMetadataError("Sender.Send has multiple supported message interfaces");
+    n.messageInterface = name;
+    n.messageClass = g_il.class_from_type(g_il.method_get_param(send, 0));
+  }
+  if (!n.messageInterface) return NetworkMetadataError("Sender.Send has no supported message interface/signature");
 
   const char* names[] = {"CS_FRIEND_LIST_SIMPLE_SYNC", "CS_SCENE_REST", "CS_PING"};
   bool found = false;
   for (unsigned i = 0; i < 3; ++i) {
-    auto& msg = n.messages[i];
+    ProtoMessage msg{};
     msg.name = names[i];
     msg.klass = FindClass(assemblies, count, "Proto", names[i]);
     if (!msg.klass) continue;
-    msg.ctor = FindMethod(msg.klass, ".ctor", false, "System.Void");
-    if (!msg.ctor || g_il.class_is_valuetype(msg.klass)) return false;
-    if (i == 2) {
-      msg.timestamp = g_il.class_get_field_from_name(msg.klass, "clientTs_");
-      if (!msg.timestamp || (g_il.field_get_flags(msg.timestamp) & 0x10u) ||
-          !TypeIs(g_il.field_get_type(msg.timestamp), "System.UInt64")) return false;
+    msg.ctor = FindDeclaredMethod(msg.klass, ".ctor", false, "System.Void");
+    if (!msg.ctor || g_il.class_is_valuetype(msg.klass) ||
+        !g_il.class_is_assignable_from(n.messageClass, msg.klass)) {
+      DiagnosticLog("Skipping %s: constructor or %s implementation mismatch", msg.name, n.messageInterface);
+      continue;
     }
+    if (i == 2) {
+      const char* timestampField = !strcmp(n.messageInterface, "ProtoBuf.IExtensible")
+        ? "<ClientTs>k__BackingField" : "clientTs_";
+      msg.timestamp = g_il.class_get_field_from_name(msg.klass, timestampField);
+      if (!msg.timestamp || (g_il.field_get_flags(msg.timestamp) & 0x10u) ||
+          !TypeIs(g_il.field_get_type(msg.timestamp), "System.UInt64")) {
+        DiagnosticLog("Skipping %s: %s is not an instance UInt64 field", msg.name, timestampField);
+        continue;
+      }
+    }
+    // A broken optional fallback must not invalidate a verified earlier message.
+    n.messages[i] = msg;
     found = true;
   }
-  if (!found) return false;
+  if (!found) return NetworkMetadataError("No compatible keepalive message");
   g_net = n;
+  DiagnosticLog("Network API resolved: Sender.Send(%s)", n.messageInterface);
   return true;
 }
 
